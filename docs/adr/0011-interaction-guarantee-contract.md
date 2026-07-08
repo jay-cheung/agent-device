@@ -238,6 +238,34 @@ the daemon there destroyed every healthy app session the daemon owned.
   press guarantees"), which matters for small-model agents that only read the
   contract, never the code.
 
+### Synthesized iOS gesture policy
+
+Synthesized iOS gestures (`scroll`, synthesized coordinate `tap`, synthesized
+`drag`, and synthesized `sequence` tap/drag steps) are intentionally not folded
+into the element dispatch-path matrix above. They do not resolve selectors or
+refs, so claiming the element-targeting guarantees would be misleading. Their
+AX-health, keyboard-probe, frame-source, activation-preflight, and
+XCTest-coordinate fallback rules stay runner-local in
+`RunnerTests+SynthesizedGesturePolicy.swift`. That Swift policy is the source of
+truth because the current table has only three behaviors:
+
+- coordinate synthesized tap never probes keyboards and may use the coordinate
+  fallback;
+- default iOS scroll probes keyboards only after AX is known healthy and must
+  not fall back to `XCUICoordinate`;
+- explicit synthesized drag, including synthesized sequence tap/drag steps, may
+  still use the coordinate fallback before AX health is known, but stops using
+  it once a snapshot stamps AX unavailable.
+
+The non-obvious parts are covered by gated XCTest policy tests instead of a
+cross-language mirror. A future sibling registry should only be introduced once
+gesture policy grows beyond this small runner-local table or needs host-side
+tooling to consume it directly. Synthesized coordinate contexts use screenshot
+dimensions as their only frame source; cheaper frame sources such as
+`app.frame`, windows, accessibility frames, or native screen bounds are
+intentionally excluded because they can diverge from full-screen screenshot
+coordinates on affected simulators.
+
 ## Migration plan
 
 Each step lands green and independently useful:
