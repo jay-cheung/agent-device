@@ -1,5 +1,56 @@
 # Testing Notes
 
+## Affected-check selector (`pnpm check:affected`)
+
+`pnpm check:affected --base <ref>` derives which local checks a diff needs, so
+agents stop interpreting the testing matrix by hand. It is a **fail-open
+advisory**: existing GitHub CI stays authoritative and required, and this only
+narrows the *local* feedback loop.
+
+```sh
+pnpm check:affected --base origin/main --run     # default agent loop: plan + run
+pnpm check:affected --base origin/main           # human-readable plan only
+pnpm check:affected --base origin/main --json    # machine-readable plan only
+```
+
+The selection is derived from repository sources of truth rather than a
+hand-maintained path map:
+
+- **Affected Vitest tests** are delegated to `vitest related --run`, using
+  Vitest's own project configuration and static module graph. The selector
+  passes its complete changed-file set instead of reproducing Vitest globs or
+  import ownership. Dynamic-import relationships remain outside Vitest's
+  analysis; GitHub's authoritative full suites still cover that boundary.
+- **Non-Vitest suites** retain explicit ownership. Root
+  `test/integration/*.ts` files use the Node integration lane, SkillGym owns its
+  harness and skill guidance, and platform/build tools keep their native gates.
+- **Always-on gates** (`lint`, `typecheck`, `layering`, `fallow`, `format`) fire
+  for their input categories and are never silently skipped. Platform source
+  also selects the provider-integration and coverage gates required by the
+  Testing Matrix.
+- **Commands** are resolved from real `package.json` scripts, so a renamed
+  script fails loudly instead of dropping a gate.
+- A **small explicit build-ownership layer** covers the paths whose owning build
+  cannot be derived: Swift runner, Android helpers, macOS helper, MCP metadata,
+  and the public package surface (itself derived from `package.json` `exports`).
+- **SkillGym ownership** covers skill guidance (`skills/`) and the SkillGym
+  harness (`test/skillgym/`) — those changes select the (local-only) SkillGym
+  suite, and their Markdown is treated as skill/harness input, not inert docs.
+
+Changed-file discovery folds working-tree state into the local plan: in the
+default local mode (`--head HEAD`) it unions the committed `base..HEAD` diff with
+staged, unstaged, and untracked files, and disables rename detection so **both**
+sides of a rename are classified (a moved file cannot look docs-only by its
+destination alone).
+
+Anything the selector cannot classify — unknown, ambiguous, workflow/tooling, or
+a change to the selector's own sources (including the `AGENTS.md` Testing
+Matrix) — **fails open to the full check set**.
+The plan documents the rule and changed path behind every selected check.
+
+Model and catalog live under `scripts/check-affected/`; the derivation is guarded
+by `pnpm check:affected:test` (the `Affected-check Selector` CI job).
+
 ## Live web smoke
 
 The live web platform smoke runs the public built CLI against a local fixture page through the managed web backend:
