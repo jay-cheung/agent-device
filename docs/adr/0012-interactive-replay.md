@@ -1,4 +1,4 @@
-# ADR 0012: Interactive Replay (agent-in-the-loop repair, resolution disclosure, retiring `--update` healing)
+# ADR 0012: Interactive Replay (agent-in-the-loop repair, resolution disclosure, retiring silent `--update` healing, and agent-supervised re-record repair)
 
 ## Status
 
@@ -391,8 +391,9 @@ target-binding divergences reported before the device action. This is not genera
 **Divergence is a structured error, not success data.** The daemon returns `ok:false` with code
 `REPLAY_DIVERGENCE` and a `details.divergence` object for both an action failure and a target-binding
 mismatch. The object has version `1` and contains `kind`, `step` (`index`, `source.path`, `source.line`),
-`action`, `cause`, `screen`, `suggestions`, `resume`, and, for binding failures, `targetBinding`
-(`classification`, `matchCount`, `recorded`, `observed`, `mismatches`, `candidates`). `kind` is one of
+`action`, `cause`, `screen`, `suggestions`, `resume`, `repairHint`, and, for binding failures,
+`targetBinding` (`classification`, `matchCount`, `recorded`, `observed`, `mismatches`, `candidates`).
+`kind` is one of
 `action-failure`, `selector-miss`, `identity-mismatch`, or `identity-unverifiable` — the latter three are
 decision 3's target-binding classes, and `targetBinding.classification` always equals the top-level
 `kind`. `targetBinding.matchCount` follows decision 3's presence rule exactly: present (0..N) for
@@ -402,6 +403,15 @@ annotation (path 1), which fires before any resolution.
 `step.index` is the 1-based executable-plan ordinal, not a source
 line. Its source location is diagnostic only. A Maestro parser must preserve the original file and line
 through includes so that source location is actionable.
+
+`repairHint` is a **single bounded enum value** — exactly one of `record-and-heal`, `state-repair`,
+`caution`, or `manual` (never a list; a fixed, closed set), present on every divergence. The daemon
+computes it (decision 6, R3) and it is always defined for every divergence — defaulting to `manual` when
+no safer routing can be proven — so a consuming caller never sees it absent or null. It is a small fixed
+token that costs no meaningful bytes, so it is carried at every response level, including compact
+(`--level digest`), and must survive all four projections intact — daemon text summary, JSON, Node
+client `AppError`, and MCP `structuredContent`. Decision 6 defines its computation and meaning; this
+contract only guarantees it is transported.
 
 `screen` is discriminated. `{ state: "available", refsGeneration, refs, truncated }` is a fresh,
 healthy snapshot digest and the only form that issues actionable refs. `{ state: "unavailable", reason,
@@ -498,13 +508,173 @@ Implementation is not accepted on benchmark evidence alone. Required automated c
   changes, `resume.allowed` reasons, `--from` indexing, variable-output and control-flow rejection, and
   `test --from` rejection;
 - daemon/client/CLI/MCP contracts proving the typed divergence survives failure, JSON and MCP structured
-  output retain it, MCP pins only actionable error-path refs, and no text-only path drops the report; and
+  output retain it, MCP pins only actionable error-path refs, no text-only path drops the report, and the
+  `repairHint` enum is present and identical across all four projections (text, JSON, client `AppError`,
+  MCP `structuredContent`), including at compact `--level digest`;
 - `--update` retirement tests proving it never rewrites the source file and only returns bounded
-  suggestions ranked and deduplicated per decision 1's total order.
+  suggestions ranked and deduplicated per decision 1's total order; and
+- decision 6 acceptance tests: a healed sibling `.ad` replays end-to-end in a **fresh session** with
+  every selector step annotated and no bare `@ref`; daemon-side `repairHint` computation for all four
+  values (`record-and-heal`, `state-repair`, `caution`, `manual`) against the four divergence kinds
+  (`selector-miss`, `identity-mismatch`, `identity-unverifiable`, `action-failure`), proving the mapping
+  is total — including the no-`targetEvidence` fail-safe to `manual` (an unannotated `action-failure` per
+  PR #1223) and the sparse/unavailable-capture fail-safe to `manual`, and the post-response-capture
+  container test for `action-failure`; `--no-record` state-fix actions excluded from the healed script
+  while the corrective selector-drift action is included; prefix steps re-annotated with fresh
+  `target-v1` evidence when recording is armed from step 1 (R1); a `--from`-continuation test proving the
+  already-recorded prefix is never duplicated by a second full replay on the same session (R2); a
+  boundary-watermark test proving a reused session's pre-invocation actions are excluded from the healed
+  script (R6); and a writer fail-loud test proving a bare `@ref` that cannot materialize to a selector
+  errors with a non-zero exit rather than being silently dropped (R4).
 
 Extend the settle benchmark (`~/.agent-device-bench/rnnav-matrix.py` pattern, external harness) with a
 replay arm only after these contracts pass: measure clean replay and one induced divergence repaired
 through the allowed `--from` loop.
+
+### 6. Agent-supervised re-record repair ("heal-by-doing")
+
+Decision 1 retired `--update`'s SILENT auto-rewrite because selector agreement is not proof of the same
+target. This decision is not a reversal of that: it adds an EXPLICIT, agent-driven repair path — the
+agent performs the failed step with ordinary interactive commands an operator can see, and the CLI
+records what actually worked. Nothing here re-applies a candidate selector unattended; retiring silent
+auto-rewrite and adding explicit agent-driven re-record are consistent, not contradictory.
+
+Decision 1's replacement repair surface for a selector-drift divergence (a recorded label/id renamed so
+the selector no longer matches) is: hand-edit the `.ad` selector text, then fresh-replay. Measured
+2026-07-12: this is a hostile repair surface for models — a small-model (Haiku) repair run thrashed 26
+turns and corrupted the `.ad` to `INVALID_ARGS`, editing escaped-quote selector chains
+(`label="X" || label="X"`), and the divergence `suggestions` list was empty for the renamed label. The
+divergence *report* is good (decision 4); the repair *affordance* is broken. Models should not edit `.ad`
+text.
+
+When a replay diverges on selector drift, the agent instead performs the failed step's **intent** with
+ordinary interactive commands against the fresh blessed `@refs` the divergence's `screen` already hands
+it (decision 4), and the CLI emits a healed `.ad` equal to the session's actual successful execution
+path — no text editing, no silent similarity-heal.
+
+**Core mechanism — the healed script IS `session.actions`.** No new splice engine. `session.actions`
+already accumulates every executed action for the session's lifetime
+(`src/daemon/session-action-recorder.ts:37`, unconditional push), and the divergence refusal is
+pre-dispatch (target verification refuses before the device action, decision 3), so a divergent step is
+never pushed. Across a repair session: original steps that verified and dispatched land in
+`session.actions`; the divergent step is absent (refused pre-dispatch, never recorded); the agent's
+corrective interactive action(s) land in `session.actions` with fresh `target-v1` evidence, because
+recording is armed and armed recording also disables the direct-iOS fast path (PR #1196) so evidence is
+computable. `formatSessionScript` over `session.actions` from the repair-run boundary (R6 — the slice
+recorded during this repair, not the whole session history) is therefore the healed script: the path that
+actually worked. The only net-new code is flag-threading plus one writer entry point (see Migration
+plan).
+
+**The two repair sub-flows (routed by the mechanical `repairHint`).** A `selector-miss` with
+`matchCount: 0` (decision 3) is the same wire surface for "label renamed" and "app is on the wrong screen
+entirely", so the sub-flow is not left to the agent to guess. The daemon computes a `repairHint` enum at
+divergence time (R3 below) and sends only that value on the wire: `record-and-heal` selects the
+selector-drift sub-flow, `state-repair` selects the app-state sub-flow. The agent follows the hint —
+overriding with a fresh `screen.refs` read (or one `snapshot -i`) only when it is genuinely ambiguous —
+rather than routing blind. The two sub-flows use different recording discipline:
+
+1. **Selector drift** (expected screen, one control renamed or moved): the agent presses the correct
+   control via a blessed `@ref` from `screen.refs` — recorded (no `--no-record`). This corrective
+   action, with fresh evidence, becomes the healed step. Then `replay --from N+1 --plan-digest
+   <original>` continues past the step the agent just performed. If a later step also diverges, the loop
+   repeats.
+2. **App-state divergence** (the script is correct; the app is simply in the wrong state): the agent
+   drives the app to the expected state with `--no-record` actions — one-time state setup, not script
+   steps, and must not pollute the healed script — then `replay --from N --plan-digest <original>`
+   re-runs the *unchanged* step N, which now matches.
+
+**Required protocol rules (normative).** These six rules are the difference between "the mechanism
+works" and "healed scripts are always valid":
+
+- **R1 — recording is armed from the first replay, not on divergence.** `replay <file>.ad
+  --save-script[=<out>]` sets `session.recordSession = true` before step 1, not on divergence. Prefix
+  steps are re-executed during the repair replay; only if recording is armed from the start do they land
+  in `session.actions` with fresh `target-v1` evidence. Arming late yields a hybrid healed script (an
+  annotated corrective step glued to a bare, unannotated prefix) that re-diverges on its own next replay
+  (`src/daemon/handlers/interaction-common.ts:64-65` attaches evidence only when `recordSession` was
+  true when the step ran).
+- **R2 — `--from` continuation only; never re-run the full replay on the same session.** After a
+  divergence at step N and the corrective action, the agent must continue with `replay --from k
+  --plan-digest <original>`, not a fresh full `replay`. A full re-replay on the same session re-appends
+  the already-recorded prefix `1..N-1` to `session.actions` — duplication, because
+  `session-action-recorder.ts:37` pushes unconditionally and replay dispatch does not inject `noRecord`.
+  The two sub-flows differ in `k`: app-state uses `k = N` (re-run the unchanged step after fixing state);
+  selector-drift uses `k = N + 1` (the agent already performed step N manually; do not re-run it).
+- **R3 — a mechanical `repairHint` on the divergence payload gates the sub-flow; no LLM-only routing.**
+  The `repairHint` enum is computed **daemon-side at divergence time, never by the agent**, from two
+  inputs the daemon already holds: (i) the recorded `targetEvidence` — the daemon owns the parsed
+  `target-v1` `ancestry`/`scrollRegion` (decision 3), *when the diverged action carried an annotation* —
+  and (ii) the divergence's own screen capture — the daemon owns the whole current tree, not the flat,
+  20-capped `screen.refs` shipped on the wire. Only the resulting enum value crosses the wire, so "the
+  wire omits `ancestry`" is moot: the container-presence test runs where both inputs exist.
+  **Capture timing differs by kind, and the test uses whichever capture the kind already provides:** a
+  target-binding kind (`selector-miss`/`identity-mismatch`/`identity-unverifiable`) verifies before
+  dispatch, so its capture is the PRE-action tree; an ordinary `action-failure` (the dispatch-thrown
+  path, per PR #1223) captures its screen AFTER the failed response, so its capture is the POST-response
+  tree. The post-response tree is adequate for the only question the test asks — "does the recorded
+  container currently exist?" — so `action-failure` does not need a separately stored pre-action tree.
+  The mapping covers all four divergence `kind`s:
+  - **selector-miss** (`matchCount: 0`): recorded container still present in the current capture →
+    `record-and-heal` (selector drift); container absent or the screen differs → `state-repair`
+    (app-state).
+  - **identity-mismatch** (`matchCount >= 1`, wrong identity) → `caution`: something matched the recorded
+    selector, so a blind re-press may repeat the mistake.
+  - **identity-unverifiable** → `manual`: future replays block this step pre-action, so heal-by-doing is
+    a poor fit.
+  - **action-failure** → the same container-presence test over its post-response capture: container
+    present → `record-and-heal`, else `manual`.
+
+  The mapping is **total**: every (`kind` × evidence-presence × capture-availability) triple resolves to a
+  defined enum, and any case that cannot be proven safe defaults to `manual`. Two fail-safes make it so.
+  First, when the diverged action carried **no recorded `targetEvidence`** — PR #1223 wraps unannotated
+  actions too, so this is reachable for `action-failure` and for any kind on a legacy/unannotated script —
+  there is no recorded container to test → `manual`. Second, when the divergence capture is sparse or
+  unavailable so the container-presence test cannot run → `manual`. This resolves the routing mechanically
+  instead of leaving it to agent judgment.
+- **R4 — corrective actions must materialize to selector form; the writer fails loudly on a bare `@ref`
+  cross-session export.** A `press @e12` normally resolves a `selectorChain` at runtime
+  (`src/daemon/handlers/interaction-touch-targets.ts`), which `buildOptimizedActions`
+  (`src/daemon/session-script-writer.ts:69-83`) rewrites to a selector line. If no `selectorChain` was
+  captured, the writer must refuse to emit a bare `@ref` line into a persisted `.ad` — a session-bound
+  ref will not resolve in a fresh run. It **fails loudly**: an error surfaced to the user with a non-zero
+  exit, never a swallowed or silently-dropped line (existing session-write paths swallow such failures;
+  this one must not), so the repair never ships a non-replayable script.
+- **R5 — the repair session must contain a recorded `open`.** The repair must start with a `replay` of a
+  script whose step 1 is `open --relaunch` (or an explicit recorded `open`), so the healed `.ad` is
+  self-contained.
+- **R6 — the healed script is bounded to the repair run, not the whole session.** `replay --save-script`
+  records a **boundary watermark** = `session.actions.length` at the replay invocation (see "Emitting the
+  healed script" below). The healed `.ad` serializes only actions from that watermark onward — the repair
+  replay's own execution path — so a reused session's earlier, unrelated actions never leak into the
+  healed script. This makes the healed output independent of prior session history without requiring a
+  fresh session for the repair itself.
+
+**Acceptance test (mandatory).** A healed sibling `.ad` produced by the repair loop must replay
+end-to-end in a **fresh session** with every selector step annotated and no bare `@ref`.
+
+**Digest and resume — unchanged, live-session loop.** Per decision 4, "editing a script requires a fresh
+full replay" governs validating a persisted, on-disk *edited* `.ad`. It does not block the live loop
+here: the repair happens in one live session against the unedited original file, so its plan digest is
+stable — `--from k --plan-digest <original>` is exactly decision 4's already-designed "perform step
+manually, then resume" loop. Steps `1..k-1` never re-run, so decision 4's non-idempotency guarantee holds
+by construction. The healed `.ad` is written only when the repair ends (below) and is a fresh script for
+*future* runs, carrying the same pre-existing non-idempotency caveat as any hand-written `.ad`.
+
+**Emitting the healed script — opt-in via `--save-script`.** Arming and emission reuse the existing
+`--save-script` vocabulary and the precedented close-time write:
+
+- `replay <file>.ad --save-script[=<out>]` arms the repair loop at invocation, before step 1: it sets
+  `session.recordSession = true` (mirroring `session-close.ts:122-124`'s existing `saveScript` handling)
+  **and** records the repair-run boundary watermark `session.actions.length` (R6). Absent this flag,
+  replay behaves exactly as today: no recording, no heal. The heal is opt-in, preserving decision 1's "no
+  silent rewrite."
+- The healed `.ad` is written when the agent ends the repair, reusing `close --save-script <out>`
+  (already serializes `session.actions` via `SessionScriptWriter.write`,
+  `src/daemon/session-script-writer.ts:30-52`) but over the post-watermark slice only (R6). When no
+  `<out>` path is given, the default is the **`<original-stem>.healed.ad` sibling**: the original script's
+  path with its `.ad` extension replaced by `.healed.ad` (e.g. `flows/login.ad` → `flows/login.healed.ad`),
+  written beside the original. The original is never overwritten in place without an explicit `<out>`
+  path, so a human reviews the diff and promotes it.
 
 ## Consequences
 
@@ -535,6 +705,15 @@ through the allowed `--from` loop.
   (tab+header+row sharing a label) and disclosure is nearly free for those, while rejection would fail
   all of them to catch the rare "Prevent Remove"-style case decision 3 is built to catch structurally
   instead.
+- **Decision 6's residual risk is old risk, not new.** The agent can press the wrong visible ref — live
+  interactive commands have no target-binding verification anywhere in this codebase today (see (c) in
+  Context) — but that is ordinary agent-driven-interaction risk, not a new class this decision
+  introduces. The retired-heal failure mode ("selector agreement is not proof of the same target") is
+  structurally impossible here: nothing re-matches a stale selector, because evidence is derived fresh
+  from the node the agent actually pressed.
+- **`screen.refs` is bounded, per decision 4.** The divergence report's `screen.refs` is capped at 20
+  entries at default/full level and may be filtered; if the control the agent needs is not among them,
+  one extra `snapshot -i` recovers it — a bounded, disclosed cost, not a silent gap.
 
 ## Alternatives considered
 
@@ -550,6 +729,11 @@ through the allowed `--from` loop.
 - **Auto-heal tiers** (safe-tier heals applied automatically, risky-tier surfaced): deferred, not
   rejected outright — there is no current evidence base for which heals are "safe," and tiering now
   would be speculative. Revisit if agentless CI demand for some self-repair materializes.
+- **Hand-edit `.ad` text (status quo)**: rejected — hostile to models. Measured 2026-07-12: a small
+  model (Haiku) repair run thrashed 26 turns and corrupted the `.ad` to `INVALID_ARGS` editing
+  escaped-quote selector chains.
+- **Silent auto-rewrite (the old `--update`)**: already retired (decision 1) — mis-binding risk;
+  selector agreement is not proof of the same target.
 
 ## Migration plan
 
@@ -580,3 +764,13 @@ each states its dependencies explicitly.
    report before the write path is removed), with a no-write regression test.
 7. **Benchmark extension** (decision 5) — follows the mandatory contracts; measures the economic claim
    (clean replay plus one induced divergence repaired through the allowed `--from` loop).
+8. **Agent-supervised re-record repair** (decision 6) — depends on 2 and 5 (the repair loop is built
+   entirely on the existing divergence report and `--from`/`--plan-digest` resume machinery) and on 3/4
+   (corrective actions record fresh `target-v1` evidence, so the healed script is self-consistent).
+   Prerequisite: the selector-miss → `REPLAY_DIVERGENCE` defensive fix (PR #1223) — a thrown per-action
+   selector-miss must route through the same divergence-wrapping path as a returned failure, or the
+   repair loop never sees a divergence report to act on. Net-new implementation is narrow: the daemon-side
+   `repairHint` computation over all four `kind`s (R3), `--save-script` arming plus the repair-run
+   boundary watermark on `replay` (R1/R6), the writer's post-watermark slice and bare-`@ref` fail-loud
+   guard (R4/R6) — the healed-script emission otherwise reuses `close --save-script`'s existing
+   `session.actions` serializer.
