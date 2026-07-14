@@ -476,6 +476,30 @@ repeat iteration label. Static includes, platform conditions, and fixed-count re
 indexing, so repeated source lines are distinguished by their plan index.
 
 Every divergence includes `resume: { allowed, from, reason?, planDigest, repairSessionHeld? }`.
+`from` is not merely the failed step's ordinal — it is the ordinal the caller should actually pass to
+`--from`, computed from the same `repairHint` carried alongside it (decision 6, R2/R3): for `record-and-heal`,
+`from` is the failed step's index **+ 1** (the agent performs that step manually before resuming, so
+resuming AT it would re-diverge on the exact step just completed); for every other hint (`state-repair`,
+`caution`, `manual`), `from` equals the failed step's index unchanged. This keeps the structured `resume`
+block and the `repairHint` text guidance below in agreement — a JSON/MCP-first caller that blindly resumes
+at `resume.from` gets the same continuation a text caller reads out of the rendered guidance, never a stale
+`from` that loops the caller back onto the step it just repaired.
+
+If the shifted `from` equals `actions.length + 1` (the diverged step was the plan's LAST step), that is a
+legal EMPTY-TAIL resume, not an error: there is nothing left to replay, so the resumed run executes zero
+device actions and falls straight through to the normal end-of-plan completion path, correctly flipping an
+armed repair transaction COMPLETE (decision 6, R7's `close` commit gate). Rejecting this ordinal outright
+would force the agent to `close` an INCOMPLETE transaction instead, which aborts and discards the corrective
+action it just recorded. This one-past-the-end ordinal is authorized ONLY for the EXACT session and target
+that produced it — the daemon stamps a per-session watermark (`expectedFrom`, the recorded action count at
+divergence time) whenever a `record-and-heal` divergence reports `allowed: true`, and a later `--from`
+request is accepted at `actions.length + 1` only when it matches that watermark AND the session's action
+count has grown since (proof the corrective press was actually recorded) — never a blanket "one past the
+end is fine" for any session or repair kind, which would let an unrelated or blind resume silently skip the
+plan's unresolved final step and commit an incomplete repair. The same watermark match, independent of
+whether `from` lands one past the end or still inside the plan, also gates every OTHER `record-and-heal`
+continuation: resuming at the reported `from` with the action count unchanged is rejected as proof the
+corrective press never happened, rather than silently resuming past the unrepaired step.
 `planDigest` is SHA-256 over
 the canonical fully expanded plan, including each action's command, normalized inputs, control shape,
 platform-conditioned expansion, and source provenance. Concretely "normalized inputs" bind each action's
