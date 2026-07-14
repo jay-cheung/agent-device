@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -35,10 +35,9 @@ remain compatible with selector-based replay, and add no automatic capture or pe
 
 ## Decision
 
-The terms introduced below describe the proposed target model. They do not replace the current domain
-language in `CONTEXT.md` while this ADR is Proposed and the source still implements the snapshot/stale
-marker model. The implementation change that establishes these concepts must promote the accepted
-terms into `CONTEXT.md`; documentation must not present the target model as current behavior early.
+The terms introduced below are now the implemented model; the ref-frame vocabulary is promoted into
+`CONTEXT.md`. The coarse `snapshotRefsStale` marker still backs read-only staleness warnings and is
+removed once per-platform enforcement is confirmed by live evidence (migration step 8).
 
 ### Ref frames are separate from operational observations
 
@@ -69,15 +68,15 @@ compatibility.
 
 ### Frame transitions
 
-| Event | Frame transition | Plain refs | Pinned refs |
-| --- | --- | --- | --- |
-| Internal observation that returns no refs | None | Unchanged | Unchanged |
-| Complete frame activation | New active epoch, scope `all` | Accepted from this frame | Accepted when epoch matches |
-| Non-empty partial publication | New active epoch, scope = emitted refs | Rejected | Accepted only for an emitted ref at this epoch |
-| First possible device-side effect | Advance once to `expired` | Rejected | Previous epoch rejected |
-| Additional effects while already expired | Idempotent | Rejected | Rejected |
-| Sparse, failed, or unusable capture | None | Unchanged | Unchanged |
-| Session reopen | New random-seeded lifetime | Rejected until publication | Old lifetime rejected probabilistically as today |
+| Event                                     | Frame transition                       | Plain refs                 | Pinned refs                                      |
+| ----------------------------------------- | -------------------------------------- | -------------------------- | ------------------------------------------------ |
+| Internal observation that returns no refs | None                                   | Unchanged                  | Unchanged                                        |
+| Complete frame activation                 | New active epoch, scope `all`          | Accepted from this frame   | Accepted when epoch matches                      |
+| Non-empty partial publication             | New active epoch, scope = emitted refs | Rejected                   | Accepted only for an emitted ref at this epoch   |
+| First possible device-side effect         | Advance once to `expired`              | Rejected                   | Previous epoch rejected                          |
+| Additional effects while already expired  | Idempotent                             | Rejected                   | Rejected                                         |
+| Sparse, failed, or unusable capture       | None                                   | Unchanged                  | Unchanged                                        |
+| Session reopen                            | New random-seeded lifetime             | Rejected until publication | Old lifetime rejected probabilistically as today |
 
 A complete activation normally accompanies a command result that exposes the complete ref namespace
 for the stored frame, including an interactive or intentionally scoped snapshot. An intentionally
@@ -210,9 +209,7 @@ The command descriptor's daemon facet declares a request policy:
 ```ts
 type RefFrameEffect = 'preserve' | 'may-invalidate' | 'delegated';
 
-type DaemonRefFrameEffect =
-  | RefFrameEffect
-  | ((request: DaemonRequest) => RefFrameEffect);
+type DaemonRefFrameEffect = RefFrameEffect | ((request: DaemonRequest) => RefFrameEffect);
 ```
 
 The daemon registry exposes a named resolver. Every daemon command is classified, but the
@@ -439,6 +436,27 @@ Each step lands green and independently useful:
    refresh-between-mutations, conservative fused no-op invalidation, and reads without retained
    evidence; promote the implemented vocabulary into `CONTEXT.md`; then remove the superseded coarse
    stale marker.
+
+Implementation status: steps 1–7 have landed — the ref-frame module and observation split (1), the
+complete daemon classification and gate (2), the pre-side-effect seam at every leaf (3), correct
+complete/partial publication with bounded scope, MCP pin retention, and pinned partial CLI text (4),
+Android freshness decoupled from positional ref authorization (5), the cross-platform contract and
+provider evidence (6), and fail-closed admission enforcement across platforms with typed reasons (7).
+Fresh live evidence has exercised nearly every production seam — Apple runtime-ref, direct/native
+selector, generation-pin, generic, and lifecycle paths; Android helper freshness (including proven
+non-retarget) and Android existing-session relaunch; and a real provider-backed interaction plus
+provider-backed lifecycle operation (AWS Device Farm, `backend: webdriver`: a fresh ref succeeded, an
+immediate stale ref was rejected before dispatch with the shared typed fields, an `open --relaunch`
+lifecycle mutation expired the frame, and a fresh observation restored authorization). ONE seam —
+Android blocking-dialog recovery — was NOT live-exercised: the repo harness exposes no deterministic
+app-owned ANR trigger, and no reproducible control exists to raise the system dialog on demand. The
+team accepted shipping without a live run for it: its transition and abort logic are covered by fixture
+regressions (`android-system-dialog-ref-frame.test.ts` proves recovery expires the frame before its
+tap; `interaction-android-recovery-abort.test.ts` proves an outstanding ref action then aborts with the
+shared `ref_frame_expired` rejection and no dispatch), the seam is enforced in code identically to the
+verified paths, and it is recorded here as a documented, accepted evidence gap rather than an open
+release blocker. Every other enabled seam is proven on hardware, so step 8's removal of the superseded
+coarse `snapshotRefsStale` marker is unblocked.
 
 PR #1241 landed independently as a compatible transitional fix. It rejects a known iOS stale-marker
 case before this full lifecycle is implemented; it does not own the architecture migration.
