@@ -475,29 +475,53 @@ executable plan and must be in range. It is never a YAML line number, fractional
 repeat iteration label. Static includes, platform conditions, and fixed-count repeats expand before
 indexing, so repeated source lines are distinguished by their plan index.
 
-Every divergence includes `resume: { allowed, from, reason?, planDigest, repairSessionHeld? }`.
+Every divergence includes `resume: { allowed, from, reason?, planDigest, alternateFrom?, repairSessionHeld? }`.
 `from` is not merely the failed step's ordinal — it is the ordinal the caller should actually pass to
 `--from`, computed from the same `repairHint` carried alongside it (decision 6, R2/R3): for `record-and-heal`,
 `from` is the failed step's index **+ 1** (the agent performs that step manually before resuming, so
 resuming AT it would re-diverge on the exact step just completed); for every other hint (`state-repair`,
-`caution`, `manual`), `from` equals the failed step's index unchanged. This keeps the structured `resume`
-block and the `repairHint` text guidance below in agreement — a JSON/MCP-first caller that blindly resumes
-at `resume.from` gets the same continuation a text caller reads out of the rendered guidance, never a stale
-`from` that loops the caller back onto the step it just repaired.
+`caution`, `manual`), `from` equals the failed step's index unchanged. For the SINGLE-path hints
+(`record-and-heal`, `state-repair`) `from` is the whole continuation, and a JSON/MCP-first caller that
+blindly resumes at `resume.from` reads the identical command the text guidance renders — never a stale `from`
+that loops the caller back onto the step it just repaired. The DUAL-path hints (`caution`, `manual`) are the
+exception: `from` (`N`) carries only their app-state-fix continuation, and a second ordinal — the optional
+`alternateFrom` (`N + 1`, below) — carries the record-and-heal-shaped alternate, so the structured caller
+reads BOTH fields to match the text guidance rather than `resume.from` alone.
 
-If the shifted `from` equals `actions.length + 1` (the diverged step was the plan's LAST step), that is a
+`alternateFrom` is an **additive optional** ordinal (#1262) that makes the `caution`/`manual` dual-path
+structured-caller-legible, not text-only. Those two hints have TWO legitimate repairs the daemon cannot
+disambiguate at divergence time: an app-state fix (`--no-record`, then re-run the unchanged step at `from` =
+`N`), and a record-and-heal-shaped correction (perform the diverged step's intent as a recorded action, then
+resume PAST it at `N + 1`). `from` carries the first; `alternateFrom` carries the second (`N + 1`), present
+**only when a `--from N + 1` request for this divergence would actually be accepted** — the daemon computes
+it as `evaluateReplayResumePreflight({ from: N + 1, actions }).allowed`, which additionally requires the
+diverged step `N` itself to be skip-safe (so it is absent when `N` is a `runScript` outputEnv producer or
+sits inside runtime control flow, where `--from N + 1` would be refused). Because that preflight's checked
+range is a strict superset of `from`'s, `alternateFrom` present implies `allowed: true` — it never
+contradicts the primary. Absent for `record-and-heal` (its `from` already IS the `N + 1` continuation) and
+`state-repair` (no recorded-action alternate). The `repairHint` text guidance renders the `N + 1` command
+**iff `alternateFrom` is present**, never re-deriving resumability client-side, so the text surface and the
+structured wire advertise the identical next command — closing both the text-vs-structured disagreement a
+client-side re-derivation would reintroduce and the parity gap where a structured caller saw only `from`.
+
+If the resume ordinal equals `actions.length + 1` (the diverged step was the plan's LAST step), that is a
 legal EMPTY-TAIL resume, not an error: there is nothing left to replay, so the resumed run executes zero
 device actions and falls straight through to the normal end-of-plan completion path, correctly flipping an
 armed repair transaction COMPLETE (decision 6, R7's `close` commit gate). Rejecting this ordinal outright
 would force the agent to `close` an INCOMPLETE transaction instead, which aborts and discards the corrective
 action it just recorded. This one-past-the-end ordinal is authorized ONLY for the EXACT session and target
 that produced it — the daemon stamps a per-session watermark (`expectedFrom`, the recorded action count at
-divergence time) whenever a `record-and-heal` divergence reports `allowed: true`, and a later `--from`
-request is accepted at `actions.length + 1` only when it matches that watermark AND the session's action
-count has grown since (proof the corrective press was actually recorded) — never a blanket "one past the
-end is fine" for any session or repair kind, which would let an unrelated or blind resume silently skip the
-plan's unresolved final step and commit an incomplete repair. The same watermark match, independent of
-whether `from` lands one past the end or still inside the plan, also gates every OTHER `record-and-heal`
+divergence time) when a `record-and-heal` divergence reports `allowed: true` (its own `from` is already
+`N + 1`), and — per #1262 — also for a `caution`/`manual` LAST-step divergence whose `alternateFrom` (`N + 1`)
+is preflight-safe (their `from` stays `N`, so the watermark tracks the alternate's `N + 1` empty-tail
+ordinal). Because the watermark can only be stamped on a live session, an empty-tail `alternateFrom` is
+withheld entirely when no session exists (a one-step `open` failure, or a session closed mid-replay) —
+otherwise the daemon would advertise a `--from N + 1` it must then reject. A later `--from` request is
+accepted at `actions.length + 1` only when it matches that watermark AND the session's action count has
+grown since (proof the corrective press was actually recorded) — never a blanket "one past the end is fine"
+for any session or repair kind, which would let an unrelated or blind resume silently skip the plan's
+unresolved final step and commit an incomplete repair. The same watermark match, independent of whether the
+resume ordinal lands one past the end or still inside the plan, also gates every OTHER `record-and-heal`
 continuation: resuming at the reported `from` with the action count unchanged is rejected as proof the
 corrective press never happened, rather than silently resuming past the unrepaired step.
 `planDigest` is SHA-256 over
