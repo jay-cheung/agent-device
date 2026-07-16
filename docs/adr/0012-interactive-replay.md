@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-07-10); partially implemented (last updated 2026-07-13). See [Migration progress](#migration-progress) for the per-step landing record.
+Accepted (2026-07-10); partially implemented (last updated 2026-07-16). See [Migration progress](#migration-progress) for the per-step landing record.
 
 **Implemented and merged to `main`:**
 
@@ -12,6 +12,10 @@ Accepted (2026-07-10); partially implemented (last updated 2026-07-13). See [Mig
   `REPLAY_DIVERGENCE` repair-loop fix (#1223).
 - Decision 6, the base agent-supervised re-record repair — `replay --save-script` arming, the
   post-watermark healed slice, `repairHint`, and the writer's bare-`@ref` fail-loud guard (#1228).
+- Decision 6, R7 + commit state machine (repair-transaction lifecycle) — the ARMED → COMPLETE → COMMITTED
+  commit state machine, keep-alive keyed off the persisted transaction (`resume.repairSessionHeld`, never
+  the per-request `--save-script` flag), terminal-source-`close` skipping, the `REPAIR_SESSION_EXPIRED`
+  tombstone, and race-safe atomic publication via exclusive `linkSync` (#1235).
 - Decision 4 amendment, `screen`'s capture scope and ref selection — the divergence `screen` capture runs
   through the same `captureSnapshot` wrapper as plain `snapshot` (full-window scope + Android freshness /
   post-action retry parity) under a clean, fixed capture-flags policy (a failed raw/scoped/`-d` action can
@@ -31,6 +35,9 @@ Accepted (2026-07-10); partially implemented (last updated 2026-07-13). See [Mig
   end-to-end; a container whose subtree holds a competing interactive node (canonical classification or
   hittable flag), or whose selected descendant's center falls outside the container rect, is recorded
   unchanged; `fill` is excluded (#1280).
+- Decision 6 amendment, repair-segment default exclusion of observation-only commands and the `--record`
+  opt-in — stage 1 (interim guidance only, #1287) and stage 2 (the semantic default-exclusion fix,
+  this amendment) of #1271. See the amendment under decision 6 below.
 
 **Accepted but NOT yet implemented** (this amendment; tracked by #1235 — repair-transaction lifecycle):
 the R7 repair-transaction keep-alive and its distinct `resume.repairSessionHeld` signal, the ARMED →
@@ -976,6 +983,135 @@ re-run guidance to restart the repair from the original script), never a bare `S
 `replay --save-script` on the same key **clears the tombstone and starts a fresh transaction** (`ARMED`).
 The tombstone itself expires after its bounded window, after which the key is fully free.
 
+> **Amendment (#1271 stage 2): repair-segment default exclusion of observation-only commands, and the
+> `--record` opt-in.** #1271 reported that read-only diagnostics an agent runs mid-repair to LOCATE the
+> repair target — `snapshot -i`, `get attrs`, `find`, `is` — recorded into the healed script exactly like
+> the corrective action itself. The wave-3 E3 experiment measured 0/4 trials producing a clean healed
+> script hands-off; one recorded `get attrs` caused a second, self-inflicted `identity-mismatch` divergence
+> on fresh replay. Stage 1 (#1287) shipped interim guidance only — the divergence `repairHint` and `help
+> workflow` told the agent to pass `--no-record` on those commands by hand. This amendment makes the safer
+> behavior the default, superseding stage 1's "opt out by hand" guidance with "opt in by hand" for the one
+> case that needs it.
+>
+> **1. Which observations are excluded — a PROVENANCE rule, not a command-class rule.** The exclusion
+> applies to an observation that is BOTH:
+>
+> - **observation-only by command**: `snapshot`, `get`, `is`, or a **read-only** `find` sub-action
+>   (`exists`, `wait`, `get_text`, `get_attrs`). A **mutating** `find … click|fill|focus|type` is not in
+>   this set — it is a corrective action like `press`/`fill` and always records. The top-level `wait`
+>   command is deliberately **not** in this set either: it is flow timing/synchronisation (pacing the
+>   script), not observation, so it must keep recording unconditionally — a healed script that silently
+>   dropped its own timing steps would replay differently from what actually happened; **AND**
+> - **dispatched OUT OF BAND**: typed by the agent mid-repair, NOT replayed from the `.ad` plan under
+>   repair.
+>
+> The second clause is load-bearing and is the rule's real discriminator. Replayed plan steps dispatch
+> through the ordinary request path and land in `session.actions` like any other action, and the healed
+> script IS that slice (`buildOptimizedActions` over `session.actions.slice(saveScriptBoundary)`). So a
+> command-class-only exclusion would replay an authored `is visible` assertion and then **silently drop it
+> from its own healed script** — the repaired flow would quietly stop checking what the original checked,
+> which for a deterministic QA suite is the worst possible failure mode. **Planned prefix/suffix
+> observations must survive automatically; a user must never have to annotate authored `.ad` steps with
+> `--record` to keep them.** An authored observation and an interactive diagnostic read are the same
+> command, so only provenance separates them.
+>
+> Provenance travels as `internal.replayPlanStep`, stamped by `invokeResolvedReplayAction`
+> (`src/daemon/handlers/session-replay-action-runtime.ts`) — the single point every plan step is
+> dispatched, so the marker covers annotated and unannotated steps alike. `internal` is a daemon-only
+> channel (`toDaemonRequest`, `src/daemon/server/http-server.ts`, never copies it off the wire), so
+> authored provenance cannot be spoofed by a client; this is the same channel `replayTargetGuard` and
+> `findResolvedTarget` already use. The rule is written once, in `isInteractiveObservation`
+> (`src/daemon/session-action-recorder.ts`), and both recording call sites consume it.
+>
+> **2. The corrective-read trap: why even out-of-band reads need an opt-in.** Excluding every out-of-band
+> read is still not safe on its own: a divergence's **correction** can itself be a read. In the wave-3 E3 drift, the diverged step **was** a `get`, so its corrective replacement is a
+> recorded `get` that **must** land in the heal — a blanket read-exclusion would silently drop the very
+> step being repaired, producing an incomplete heal with no signal anything was missing (the same class of
+> silent-failure mode decision 3 exists to close for target-binding, and decision 6 R4 exists to close for
+> bare `@ref` exports). Distinguishing "the read that replaces the diverged step" from "reads used to locate
+> the target" by POSITION (e.g., relative to the eventual `--from` resume) was considered and rejected: the
+> daemon records each action as it happens and has no reliable way to know, at record time, which one the
+> agent will later treat as the resume boundary — and a position-based rule would silently reinterpret
+> intent after the fact rather than let the agent state it. The adopted rule instead makes this an **explicit
+> opt-in per action**: `--record` (below) marks the ONE read that must count, independent of its position in
+> the repair segment.
+>
+> **3. Explicit recording remains possible.** `--record` forces an out-of-band observation into the heal
+> even though its command is observation-only. It exists for exactly one job: an interactive corrective
+> read the agent is deliberately inserting into the healed script. It is a no-op outside a repair-armed
+> session (there is no default exclusion to override), and it is **not** needed for authored plan steps —
+> those survive on provenance alone (rule 1).
+>
+> `--record` is **not a common flag**, unlike `--no-record`. `--no-record` applies to every recordable
+> command, mutations included, so it stays universal
+> (`COMMON_COMMAND_SUPPORTED_FLAG_KEYS`). `--record` only means something for a command the exclusion can
+> drop, so it is scoped **statically** to `snapshot`, `get`, and `is` through each command schema's
+> `allowedFlags` — accepting it on `press`/`fill`/`click` would be misleading, and the grammar rejects
+> unsupported uses before projection. `find` is the one command whose observe-vs-mutate split is a
+> POSITIONAL rather than the command name, so it cannot be settled statically: it allows `--record`
+> in the grammar and validates **dynamically** in the daemon (`handleFindCommands`), rejecting
+> `--record` on a mutating `find … click|fill|focus|type` with `INVALID_ARGS` before any device work. Both
+> halves read one shared predicate (`isReadOnlyFindAction`, `src/selectors/find.ts`), so the routing and
+> the validation can never disagree about which sub-actions observe.
+>
+> `--record` and `--no-record` express opposite intents for the same action and are **mutually exclusive**:
+> passing both is rejected as `INVALID_ARGS` before the command runs, uniformly for every surface, rather
+> than letting one silently win.
+>
+> **4. How the rule projects across CLI/Node/MCP surfaces.** The exclusion is enforced at a single
+> daemon-side choke point — `isExcludedRepairSegmentObservation` in `recordActionEntry`
+> (`src/daemon/session-action-recorder.ts`), gated on `session.saveScriptBoundary !== undefined` (set ONLY
+> by a repair-armed `replay --save-script`; an ordinary, non-repair `open --save-script`/`close --save-script`
+> authoring recording never sets it — see decision 6's "Scope" note above) and on the entry's
+> `interactiveObservation` marker, which both recording call sites
+> (`src/daemon/selector-recording.ts` for `get`/`is`/read-only `find`, `src/daemon/snapshot-runtime.ts` for
+> `snapshot`) compute from the shared `isInteractiveObservation` predicate rather than each re-deriving it.
+> Every surface reaches this same function because every surface's request reaches the same daemon.
+>
+> The flags project asymmetrically, matching their different scopes:
+>
+> - `--no-record` stays a common flag: its key is in `COMMON_COMMAND_SUPPORTED_FLAG_KEYS`, and every
+>   recordable reader forwards it through the shared `noRecordInputFromFlags` helper
+>   (`src/commands/cli-grammar/common.ts`, per #1304).
+> - `--record` is scoped: its key is NOT common, it appears in `allowedFlags` only for `snapshot`/`get`/`is`
+>   (plus `find`, which validates dynamically per rule 3), and only those readers spread
+>   `observationRecordInputFromFlags`. Two named helpers rather than one helper with an `allowRecord`
+>   policy argument: the capability is then the helper's NAME, so a mutating reader physically cannot
+>   forward `--record`, whereas a policy argument would let a future mutating reader opt in by flipping a
+>   literal with no schema change — the fail-open the split exists to prevent.
+>
+> From there both flags ride the ordinary typed path: the Node client threads them through
+> `buildRequestFlags`/`buildFlags` (`src/commands/command-flags.ts`) from `InternalRequestOptions` and each
+> typed per-command Options type (`GetOptions`/`IsOptions`/`FindOptions`/`CaptureSnapshotOptions`), and the
+> MCP tool schema exposes `record`/`noRecord` on the `get`/`is`/`find`/`snapshot` tools
+> (`src/commands/interaction/metadata.ts`, `src/commands/capture/snapshot.ts`) through the same
+> `CommandMetadata.inputSchema` + `readMetadataCommandFlags` path every other typed field already uses. No
+> surface has a separate recording contract; all of them hit the identical daemon-side default.
+>
+> **5. The fail-loud guard is the EXISTING resume watermark, not new state.** Because the exclusion happens
+> at the same point `--no-record` is enforced — before an action ever reaches `session.actions` — an excluded
+> diagnostic read never grows `session.actions.length`. That counter is exactly what
+> `describeUnperformedRecordAndHeal` (`src/daemon/handlers/session-replay-runtime-plan.ts`, R2/#1262's
+> `pendingRecordAndHeal` watermark) already compares against `actionsCountAtDivergence` to prove a corrective
+> action happened before authorizing a `record-and-heal`-shaped `--from` resume. No additional bookkeeping is
+> needed: a repair segment containing only excluded diagnostic reads is indistinguishable, at that check,
+> from a repair segment containing no activity at all, so the existing guard already refuses it. This
+> amendment only updates the guard's message to name `--record` alongside the existing `--no-record`
+> mention, since the missing corrective action may have been a read rather than a press: "no corrective
+> action was recorded in this repair segment; press the correct control via a blessed `@ref` … — or, if your
+> corrective action was a read, re-run it with `--record` … — before resuming."
+>
+> **Regression coverage** proves: an out-of-band diagnostic read inside an armed repair segment is omitted
+> from the healed script by default; an **authored** `is visible` plan step in the same repair, carrying no
+> `--record`, **survives** into the heal (the provenance rule — this fails if the exclusion is
+> command-class-only); a corrective action remains for both a mutating press/fill (unaffected — never
+> observation-only) and a `--record`ed read (the diverged-step-was-a-`get` case); the resulting healed
+> script replays cleanly in a fresh session; `--record` on a mutating `find … click` is refused with
+> `INVALID_ARGS`; the empty-segment guard refuses a blind resume with the actionable `--record` hint; and
+> ordinary, non-repair `open --save-script` authoring recording is completely unchanged — a read in a fresh
+> authoring session still records with no flag needed, because `session.saveScriptBoundary` is never set
+> there.
+
 ## Consequences
 
 - `--from` makes app state the caller's responsibility, and only accepts a resume when the planner can
@@ -1073,8 +1209,8 @@ each states its dependencies explicitly.
    daemon-side `repairHint` computation over all four `kind`s (R3), `--save-script` arming plus the
    repair-run boundary watermark on `replay` (R1/R6), the writer's post-watermark slice and bare-`@ref`
    fail-loud guard (R4/R6) — reusing `close --save-script`'s existing `session.actions` serializer.
-9. **Repair-transaction lifecycle** (decision 6, R7 + commit state machine) — **NOT YET IMPLEMENTED,
-   tracked by #1235**; depends on 8. Adds: the distinct `resume.repairSessionHeld` divergence signal and
+9. **Repair-transaction lifecycle** (decision 6, R7 + commit state machine) — **SHIPPED (#1235)**;
+   depends on 8. Adds: the distinct `resume.repairSessionHeld` divergence signal and
    R7 keep-alive keyed off the session's **persisted** repair-transaction state (so `--from` continuations
    need no repeat of `--save-script`), with `fail-fast-before-step-1` when keep-alive is impossible; the
    `ARMED → COMPLETE → COMMITTED` commit state machine where **any teardown** (explicit `close`,
@@ -1087,10 +1223,23 @@ each states its dependencies explicitly.
    pre-existing target — complete or partial, default or explicit path alike, and uniformly for an
    ordinary non-repair recording's target too, since the publish primitive is shared — never overwriting
    one; see "Scope" under Decision 6 above).
+10. **Repair-segment default exclusion of out-of-band observations, and the `--record` opt-in**
+    (decision 6 amendment) — **SHIPPED (#1271 stage 2)**; depends on 9 (`session.saveScriptBoundary`/
+    `repairSessionHeld` are the signals the exclusion and its guidance key off) and on #1304 (the shared
+    reader helper `--record`'s scoped sibling is split from). Adds: the `internal.replayPlanStep`
+    provenance marker stamped by `invokeResolvedReplayAction` (`session-replay-action-runtime.ts`);
+    default exclusion of OUT-OF-BAND `snapshot`/`get`/`is`/read-only `find` from `session.actions` while
+    repair-armed, keyed off that provenance via `isInteractiveObservation`/
+    `isExcludedRepairSegmentObservation` (`session-action-recorder.ts`), so authored plan steps survive
+    their own heal automatically; the `--record` opt-in, statically scoped to `snapshot`/`get`/`is` and
+    dynamically validated for `find`, rejected together with `--no-record` as `INVALID_ARGS`; and an
+    updated `describeUnperformedRecordAndHeal` message naming `--record` for the corrective-read case.
+    Stage 1 (#1287) shipped interim `--no-record` guidance only, gated on this same `repairSessionHeld`
+    signal.
 
 ## Migration progress
 
-Landing record for the plan above (main as of 2026-07-13). This section tracks progress only; it does
+Landing record for the plan above (main as of 2026-07-16). This section tracks progress only; it does
 not restate or amend the decisions.
 
 | Step | Decision | Status | Landed in |
@@ -1103,11 +1252,13 @@ not restate or amend the decisions.
 | 6. `--update` retirement | 1 | Shipped | #1211 |
 | 7. Benchmark extension | 5 | Deferred | — |
 | 8. Agent-supervised re-record repair, base | 6 (R1-R6) | Shipped | #1228 |
-| 9. Repair-transaction lifecycle | 6 (R7) | Not yet | #1235 |
+| 9. Repair-transaction lifecycle | 6 (R7) | Shipped | #1235 |
+| 10. Repair-segment default exclusion + `--record` | 6 amendment | Shipped | #1271 stage 2 |
 
 Step 4 (#1209) added the `selector-miss`/`identity-mismatch`/`identity-unverifiable` divergence kinds
 and a post-resolution target guard that cross-checks the dispatched winner against the verified member.
 Issue #1221 ("Complete ADR 0012 replay target-binding verification") was closed as already implemented:
 its verification scope is covered by step 4. Step 7 remains deferred. Step 8 implements the repair
-design accepted in #1226 and shipped in #1228; step 9 (R7 + commit machine) remains unimplemented,
-tracked by #1235.
+design accepted in #1226 and shipped in #1228; step 9 (R7 + commit machine) shipped in #1235. Step 10
+is #1271's two-stage arc: stage 1 (#1287) shipped interim `--no-record` guidance only; stage 2 (this
+amendment) makes exclusion the default and adds the `--record` opt-in.
