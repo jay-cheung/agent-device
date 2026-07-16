@@ -24,6 +24,13 @@ Accepted (2026-07-10); partially implemented (last updated 2026-07-13). See [Mig
   (a shared Android framework resource id such as `android:id/title`, or a reused RN `FlatList` `testID`)
   falls back to role+label in both `computeTargetEvidence`'s `target-v1` tuple and
   `buildSelectorChainForNode`'s chain (#1269).
+- Decision 3 amendment, record-time press retarget to a labeled descendant — a click/press whose
+  resolved winner is an identity-empty container (no surviving id, no label, no value, from the demoted
+  identity view) is recorded against its first labeled descendant via a recording-only side channel, so
+  both writers key off a node with selective identity while the live response stays container-based
+  end-to-end; a container whose subtree holds a competing interactive node (canonical classification or
+  hittable flag), or whose selected descendant's center falls outside the container rect, is recorded
+  unchanged; `fill` is excluded (#1280).
 
 **Accepted but NOT yet implemented** (this amendment; tracked by #1235 — repair-transaction lifecycle):
 the R7 repair-transaction keep-alive and its distinct `resume.repairSessionHeld` signal, the ARMED →
@@ -328,6 +335,33 @@ A recorded `id` never matches a node without that id.
 > Android framework resource id (`android:id/title`, present on every titled list row) is the measured
 > case, but the rule is capture-time uniqueness, not an `android:id/*` namespace heuristic: a reused RN
 > `FlatList` `testID` hits the same demotion on iOS.
+
+> **Amendment (#1280).** A **click/press** whose resolved winner is an *identity-empty* container — no
+> id survives #1269's demotion (absent, or demoted for being non-unique), no label, and no value, all
+> evaluated from the demoted identity view (a raw identifier that did not survive demotion never counts
+> as identity or text) — is **recorded** against its first labeled descendant instead of the container
+> itself, so the recorded selector chain and the `target-v1` tuple both carry a selective role+label
+> identity rather than a bare, tree-wide-shared role. The measured case is Android: a list row's
+> clickable node is a label-less `role="linearlayout"` container whose visible title lives on a child
+> `TextView`. "First labeled descendant" means the first node in document order (this section's
+> canonical total order) within the container's whole subtree whose normalized label is non-empty.
+> `fill` is deliberately excluded: its recorded chain carries `editable=true` constraints a label
+> descendant cannot satisfy, which would save an unreplayable script. The substitution is guarded
+> fail-closed, twice over: (i) it fires only when the subtree contains **no competing interactive node**
+> — none flagged `hittable`, and none whose role the canonical interactive-role classification
+> (`isSemanticTouchTarget`, the same policy hittable-ancestor promotion uses) names as an independently
+> tappable control — a row with a trailing `Switch` or `Checkbox` must not retarget, because a tap at
+> the labeled descendant's center and a tap at the container's center could land on different controls
+> once the descendant, not the container, is what replay taps; and (ii) the selected descendant's rect
+> center must lie **inside the container's rect** — the replay tap point must be provably within the
+> original activation region (missing rects fail closed). A container either guard blocks, or for which
+> no descendant carries a label, is recorded exactly as before this amendment. This is a
+> **recording-only side channel**: the live response — resolved node, selector chain, ref-label,
+> tap point, resolution disclosure, and `targetHittable`/hint — describes the dispatched container
+> end-to-end, and `resolveSelectorChain`/dispatch are unchanged; only the recorded action entry (the
+> `.ad` writer's source) and its `target-v1` evidence consume the retargeted descendant. The rule is
+> platform-agnostic: an RN `FlatList` row (`Cell`) that is label-less with a labeled `Text` child hits
+> the same substitution on iOS.
 
 **Ancestry.** The chain is the nearest **K = 8** ancestors of the target, ordered **leaf→root** (nearest
 ancestor first), each entry `{ role, label? }` under the same normalization (`role` may be the empty
