@@ -16,6 +16,7 @@ agent-device help remote
 agent-device help web
 agent-device help macos
 agent-device help dogfood
+agent-device help ios-system-ui
 ```
 
 Skills are recommended for auto-routing when your agent runtime supports them, but they are not required. The CLI help topics are the version-matched operating contract.
@@ -175,6 +176,21 @@ agent-device capabilities --session checkout --json
 - Use `--ios-simulator-device-set` and `--android-device-allowlist` when you need tenant- or lab-scoped discovery.
 - `capabilities` reports the command names supported by the selected session device or an explicit `--platform`/`--device`/`--udid`/`--serial` target.
 - In JSON output, `capabilities` returns `{ device, availableCommands }`. Use `availableCommands` for dynamic integrations instead of maintaining a separate platform support table.
+
+## Diagnostics
+
+```bash
+agent-device doctor
+agent-device doctor --platform ios
+agent-device doctor --platform android --app com.example.myapp
+agent-device doctor --remote --json
+```
+
+- `doctor` diagnoses device, app, Metro, and React Native setup/readiness issues for the selected target.
+- Use `--platform ios|android|vega|macos|linux|web|apple` to scope the checks to one backend; without it, `doctor` reports across the discoverable targets.
+- `--app <id-or-name>` focuses app-specific checks (install state, Metro/React Native wiring) on a single bundle id or app name.
+- `--remote` runs the environment-only checks that do not require a booted device, which is what CI bootstrap and the packaged-CLI smoke use.
+- `doctor` is read-only: it never boots, installs, or mutates the session device.
 
 ## Prepare Apple runner
 
@@ -477,7 +493,7 @@ agent-device install com.example.app ./build/MyApp.app --platform ios
 ```
 
 - `install <app> <path>` installs from binary path without uninstalling first.
-- Supports Android devices/emulators, iOS simulators, and iOS physical devices.
+- Supports Android devices/emulators, iOS simulators, and CoreDevice-backed iOS physical devices. On xctrace-only devices, install the app with Xcode before opening it by bundle ID.
 - Useful for upgrade flows where you want to keep existing app data when supported by the platform.
 - Remote daemons automatically upload local app artifacts for `install`; prefix the path with `remote:` to use a daemon-side path verbatim.
 - Supported binary formats: Android `.apk`/`.aab`, iOS `.app`/`.ipa`.
@@ -493,7 +509,7 @@ agent-device reinstall com.example.app ./build/MyApp.app --platform ios
 ```
 
 - `reinstall <app> <path>` uninstalls and installs in one command.
-- Supports Android devices/emulators, iOS simulators, and iOS physical devices.
+- Supports Android devices/emulators, iOS simulators, and CoreDevice-backed iOS physical devices. XCTest-backed xctrace-only devices do not expose install or app inventory operations.
 - Useful for login/logout reset flows and deterministic test setup.
 - Remote daemons automatically upload local app artifacts for `reinstall`; prefix the path with `remote:` to use a daemon-side path verbatim.
 - Supported binary formats: Android `.apk`/`.aab`, iOS `.app`/`.ipa`.
@@ -511,7 +527,7 @@ agent-device install-from-source --github-actions-artifact thymikee/RNCLI83:6635
 - `install-from-source <url>` installs from a URL source through the normal daemon artifact flow.
 - `install-from-source --github-actions-artifact <owner/repo:artifact>` passes a typed GitHub Actions artifact source through to a compatible remote daemon. Numeric artifacts are sent as `artifactId`; non-numeric artifacts are sent as `artifactName`.
 - Repeat `--header <name:value>` for authenticated or signed artifact requests.
-- Supports the same device coverage as `install`: Android devices/emulators, iOS simulators, and iOS physical devices.
+- Supports the same device coverage as `install`: Android devices/emulators, iOS simulators, and CoreDevice-backed iOS physical devices.
 - Use `install` or `reinstall` for local `.apk`, `.aab`, `.app`, and `.ipa` paths; use `install-from-source` when the artifact already exists at a URL reachable by the daemon.
 - Direct Android URL sources may be `.apk` or `.aab`.
 - Trusted artifact service URLs may resolve to archives containing one installable `.apk`, `.aab`, `.ipa`, or iOS `.app` tar archive. Prefer `--github-actions-artifact` for GitHub Actions artifacts that a compatible remote daemon can resolve with its own credentials.
@@ -715,7 +731,7 @@ agent-device perf trace stop --kind perfetto --out app.perfetto-trace
 - Android URL/deep-link opens infer the foreground package after launch when possible, including Expo Go/dev-client shells. If the session still has no app package/bundle ID, package-bound metrics remain unavailable until you `open <app>`.
 - Android frame health is reset after each successful `perf metrics` or `perf frames` read and after `open <app>`, so run `perf frames`, perform the interaction, then run `perf frames` again for a focused window.
 - Android Simpleperf and Perfetto collectors require an active Android app session with a running package process. They return artifact paths, sizes, and compact state summaries; they do not print profile or trace contents into the agent context. iOS native Simpleperf/Perfetto support is not provided by these commands.
-- On physical iOS devices, `perf metrics` and `perf frames` record short `xcrun xctrace` samples. Keep the device unlocked, connected, and the app active in the foreground while sampling.
+- On CoreDevice-backed physical iOS devices, `perf metrics` and `perf frames` record short `xcrun xctrace` samples. Keep the device unlocked, connected, and the app active in the foreground while sampling.
 - Interpretation note: this startup metric is command round-trip timing and does not represent true first frame / first interactive app instrumentation.
 - CPU data is a lightweight process snapshot, so an idle app may legitimately read as `0`.
 
@@ -750,6 +766,15 @@ agent-device react-devtools profile report @c5
 - For remote iOS bridge sessions, open the app once to create the bridge session, run `agent-device react-devtools start`, then relaunch the same bundle id with `agent-device open <bundle-id> --platform ios --relaunch` before `wait --connected`. React Native attempts the legacy DevTools websocket during JavaScript startup, so starting DevTools after the first launch can miss that connection attempt.
 - Remote bridge React DevTools assumes the React Native-bundled DevTools behavior in React Native 0.83+. Older browser/Chromium DevTools workflows are not assumed to exist inside remote sandboxes. Expo projects should be verified against the SDK's bundled React Native version before relying on this path; this release does not claim a separately verified Expo SDK version.
 - For cross-platform validation with explicit target selectors, use separate sessions/devices and restart `react-devtools` between iOS and Android runs.
+
+```bash
+agent-device react-native dismiss-overlay
+agent-device react-native dismiss-overlay --platform android
+```
+
+- `react-native dismiss-overlay` clears a React Native development overlay (a redbox/LogBox error or a collapsed warning banner) that is blocking interaction, then returns without changing app state otherwise.
+- Use it when a snapshot or interaction is blocked by a dev-only overlay; it is a no-op when no overlay is present.
+- It is supported on iOS simulators/devices and Android emulators/devices; `react-native` currently exposes only the `dismiss-overlay` helper.
 
 ## Multiple React Native worktrees
 
@@ -902,7 +927,7 @@ tail -50 ~/.agent-device/sessions/default/app.log
 
 - `logs mark "before submit"` lines are prefixed with `[agent-device][mark][...]`, so grep for `agent-device.*mark` when you need timing markers back quickly.
 
-- iOS `record` works on simulators and physical devices.
+- iOS `record` works on simulators and CoreDevice-backed physical devices.
 
 - iOS simulator recording uses native `simctl io ... recordVideo`.
 
@@ -1027,8 +1052,10 @@ agent-device artifacts --provider aws-device-farm --provider-session <remote-acc
 
 For CLI-discoverable setup guidance, run `agent-device help physical-device`.
 
-- Xcode + `xcrun devicectl` available.
+- Xcode with `xcrun devicectl` and `xcrun xctrace` available.
 - Paired/trusted physical device, connected, unlocked when needed, with Developer Mode enabled.
+- Older devices discovered only through `xctrace` use the XCTest backend automatically; its runner commands travel through macOS `usbmuxd`, so keep the device connected by cable.
+- XCTest-backed devices support open/close, interactions, snapshots, and screenshots. App inventory, install/reinstall, logs, performance sampling, recording, deep links, and launch arguments require CoreDevice.
 - The `AgentDeviceRunner` XCTest host must be signed before commands can run on a physical device.
 - Start with Automatic Signing and only these env vars:
   - `AGENT_DEVICE_IOS_TEAM_ID`
@@ -1041,3 +1068,12 @@ For CLI-discoverable setup guidance, run `agent-device help physical-device`.
 - If you override the iOS runner derived-data path and also force cleanup, keep `AGENT_DEVICE_IOS_RUNNER_DERIVED_PATH` under the project `.tmp/` directory. Other cleanup override paths are rejected with a recovery hint.
 - For daemon startup troubleshooting:
   - follow stale metadata hints for `<state-dir>/daemon.json` and `<state-dir>/daemon.lock` (`state-dir` defaults to `~/.agent-device` for packaged installs, or a worktree-scoped dir under `~/.agent-device/dev/` from source)
+
+## iOS SpringBoard, widgets, and system-UI surfaces
+
+For CLI-discoverable workflow guidance, run `agent-device help ios-system-ui`.
+
+- `agent-device open com.apple.springboard --platform ios` binds the session to SpringBoard today; this is verified on iOS simulator only. Physical-iPhone SpringBoard support is not yet verified — see [#1296](https://github.com/callstack/agent-device/issues/1296).
+- The full widget add/edit/remove flow is selector-driven from a fresh `snapshot -i`, except two coordinate-based steps: the empty-space long-press that enters edit mode, and (until fixed) the widget-gallery search-result rows, which currently return unlabeled accessibility nodes.
+- SpringBoard labels vary by iOS version and locale; discover them from the current snapshot rather than hard-coding strings like `Edit` or `Add Widget`.
+- Reopen the app bundle under test to return to normal app automation after a SpringBoard step.
